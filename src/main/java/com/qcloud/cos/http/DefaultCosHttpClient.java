@@ -505,8 +505,8 @@ public class DefaultCosHttpClient implements CosHttpClient {
     }
 
     private <X extends CosServiceRequest> void checkResponse(CosHttpRequest<X> request,
-            HttpRequestBase httpRequest,
-            HttpResponse httpResponse) {
+                                                             HttpRequestBase httpRequest,
+                                                             HttpResponse httpResponse) {
         if (!isRequestSuccessful(httpResponse)) {
             try {
                 throw handlerErrorMessage(request, httpRequest, httpResponse);
@@ -530,8 +530,8 @@ public class DefaultCosHttpClient implements CosHttpClient {
     }
 
     private <X extends CosServiceRequest> boolean shouldRetry(CosHttpRequest<X> request, HttpResponse response,
-            Exception exception, int retryIndex,
-            RetryPolicy retryPolicy) {
+                                                              Exception exception, int retryIndex,
+                                                              RetryPolicy retryPolicy) {
         if (retryIndex >= maxErrorRetry) {
             return false;
         }
@@ -542,7 +542,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
 
         if (exception instanceof CosServiceException) {
             if (((CosServiceException) exception).getStatusCode() == 301 || ((CosServiceException) exception).getStatusCode() == 302 || ((CosServiceException) exception).getStatusCode() == 307) {
-                return shouldRetry3xxException(request, (CosServiceException) exception);
+                return shouldRetry3xxException(request, response, (CosServiceException) exception);
             }
         }
 
@@ -552,8 +552,12 @@ public class DefaultCosHttpClient implements CosHttpClient {
         return false;
     }
 
-    private <X extends CosServiceRequest> boolean shouldRetry3xxException(CosHttpRequest<X> request, CosServiceException cse) {
-        if (!clientConfig.isChangeEndpointRetry() || (cse.getRequestId() != null && !cse.getRequestId().isEmpty())) {
+    private <X extends CosServiceRequest> boolean shouldRetry3xxException(CosHttpRequest<X> request, HttpResponse response, CosServiceException cse) {
+        if (!clientConfig.isChangeEndpointRetry()) {
+            return false;
+        }
+
+        if (cse.getRequestId() != null && !cse.getRequestId().isEmpty()) {
             return false;
         }
 
@@ -562,13 +566,16 @@ public class DefaultCosHttpClient implements CosHttpClient {
             String lastEndpoint = request.getEndpoint();
             String lastHost = reqHeaders.get(Headers.HOST);
 
-            return isCosDefaultHost(lastHost, lastEndpoint);
+            if ((isCosDefaultHost(lastHost, lastEndpoint)) || isCIDefaultHost(lastHost)
+                    && isSignatureGeneratedBySDK(request))  {
+                return true;
+            }
         }
 
         return false;
     }
 
-    protected HttpResponse executeOneRequest(HttpContext context, HttpRequestBase httpRequest) throws Exception{
+    protected HttpResponse executeOneRequest(HttpContext context, HttpRequestBase httpRequest) throws Exception {
         return httpClient.execute(httpRequest, context);
     }
 
@@ -585,7 +592,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
 
     @Override
     public <X, Y extends CosServiceRequest> X exeute(CosHttpRequest<Y> request,
-            HttpResponseHandler<CosServiceResponse<X>> responseHandler)
+                                                     HttpResponseHandler<CosServiceResponse<X>> responseHandler)
             throws CosClientException, CosServiceException {
 
         HttpResponse httpResponse = null;
@@ -606,7 +613,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
 
         long startTime = 0;
         long endTime = 0;
-        int  response_status = 0;
+        int response_status = 0;
 
         int retryIndex = 0;
         while (true) {
@@ -810,7 +817,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
         } catch (InterruptedException ie) {
             if (originRequest.getClientAbortTaskMonitor().hasTimeoutExpired()) {
                 Thread.interrupted();
-                String errorMsg = "InterruptedException: time out after waiting  " + this.clientConfig.getRequestTimeout()/1000 + " seconds";
+                String errorMsg = "InterruptedException: time out after waiting  " + this.clientConfig.getRequestTimeout() / 1000 + " seconds";
                 throw new CosClientException(errorMsg, ClientExceptionConstants.REQUEST_TIMEOUT, ie);
             }
             if (!httpRequest.isAborted()) {
@@ -820,7 +827,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
         } catch (AbortedException ae) {
             if (originRequest.getClientAbortTaskMonitor().hasTimeoutExpired()) {
                 Thread.interrupted();
-                String errorMsg = "AbortedException: time out after waiting  " + this.clientConfig.getRequestTimeout()/1000 + " seconds";
+                String errorMsg = "AbortedException: time out after waiting  " + this.clientConfig.getRequestTimeout() / 1000 + " seconds";
                 throw new CosClientException(errorMsg, ClientExceptionConstants.REQUEST_TIMEOUT, ae);
             }
             if (!httpRequest.isAborted()) {
@@ -853,6 +860,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
                 statusCode = statusLine.getStatusCode();
             }
 
+            // 3xx重定向：301/302/307立即切换，308不切换（http到https的重定向）
             if (statusCode == 301 || statusCode == 302 || statusCode == 307) {
                 changeRequestHost(request);
                 return;
@@ -864,8 +872,11 @@ public class DefaultCosHttpClient implements CosHttpClient {
         }
 
         if (httpResponse != null) {
+            boolean isCIRequest = request.getOriginalRequest() instanceof CIServiceRequest;
+            String requestIdHeader = isCIRequest ? Headers.CI_REQUEST_ID : Headers.REQUEST_ID;
+
             for (Header header : httpResponse.getAllHeaders()) {
-                if (Objects.equals(header.getName(), Headers.REQUEST_ID)) {
+                if (header.getName().equalsIgnoreCase(requestIdHeader)) {
                     String value = CodecUtils.convertFromIso88591ToUtf8(header.getValue());
                     if (value != null && !value.isEmpty()) {
                         return;
@@ -879,7 +890,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
             String lastEndpoint = request.getEndpoint();
             String lastHost = reqHeaders.get(Headers.HOST);
 
-            if (isCosDefaultHost(lastHost, lastEndpoint)) {
+            if ((isCosDefaultHost(lastHost, lastEndpoint) || isCIDefaultHost(lastHost)) && (isSignatureGeneratedBySDK(request))) {
                 changeRequestHost(request);
             }
         }
@@ -933,8 +944,22 @@ public class DefaultCosHttpClient implements CosHttpClient {
         return matcherEndpoint.matches() && matcherHost.matches() && !isAccEndpoint && !isAccHost;
     }
 
+    private boolean isCIDefaultHost(String host) {
+        return host.matches(".+\\.ci\\..+\\.myqcloud\\.com") ||
+                host.matches("ci\\..+\\.myqcloud\\.com");
+    }
+
     private <Y extends CosServiceRequest> void changeRequestHost(CosHttpRequest<Y> request) {
-        String retryEndpoint = String.format("%s.%s.tencentcos.cn", request.getBucketName(), Region.formatRegion(clientConfig.getRegion()));
+        String currentHost = request.getHeaders().get(Headers.HOST);
+        String retryEndpoint = null;
+
+        if (isCIDefaultHost(currentHost)) {
+            retryEndpoint = currentHost.replace(".myqcloud.com", ".tencentci.cn");
+        } else {
+            retryEndpoint = String.format("%s.%s.tencentcos.cn",
+                    request.getBucketName(),
+                    Region.formatRegion(clientConfig.getRegion()));
+        }
         request.addHeader(Headers.HOST, retryEndpoint);
         COSSigner cosSigner = clientConfig.getCosSigner();
         COSCredentials cosCredentials = request.getCosCredentials();
@@ -945,12 +970,15 @@ public class DefaultCosHttpClient implements CosHttpClient {
         cosSigner.sign(request, cosCredentials, expiredTime);
 
         String endpointAddr = clientConfig.getEndpointResolver().resolveGeneralApiEndpoint(retryEndpoint);
-
         String fixedEndpointAddr = request.getOriginalRequest().getFixedEndpointAddr();
         if (fixedEndpointAddr != null) {
             request.setEndpoint(fixedEndpointAddr);
         } else {
             request.setEndpoint(endpointAddr);
         }
+    }
+
+    private <Y extends CosServiceRequest> boolean isSignatureGeneratedBySDK(CosHttpRequest<Y> request) {
+        return request.getCosCredentials() != null;
     }
 }
